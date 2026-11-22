@@ -51,16 +51,55 @@ jobs:
                   grep -q "import io.github.vinceglb.filekit.path" "$f" || sed -i '1s/^/import io.github.vinceglb.filekit.path\n/' "$f"
                   printf '\nprivate suspend fun io.github.vinceglb.filekit.PlatformFile.atomicMove(destination: io.github.vinceglb.filekit.PlatformFile) { val s = java.io.File(this.path); val d = java.io.File(destination.path); d.parentFile?.mkdirs(); if (d.exists()) d.delete(); if (!s.renameTo(d)) { s.copyTo(d, true); s.delete() } }\n' >> "$f"
               done
+
+      - name: Build libfixapi
+        run: |
+              cat << 'EOF' > /tmp/fixapi.c
+              #include <jni.h>
+              #include <string.h>
+              #include <stdarg.h>
+              #include <sys/mman.h>
+              #include <unistd.h>
+              static jmethodID mid;
+              static struct JNINativeInterface orig;
+              jmethodID hGet(JNIEnv *e, jclass c, const char *n, const char *s) {
+                  if (n && s && !strcmp(n, "getParameterCount") && !strcmp(s, "()I")) {
+                      jmethodID m = orig.GetMethodID(e, c, "getParameterTypes", "()[Ljava/lang/Class;");
+                      if ((*e)->ExceptionCheck(e)) (*e)->ExceptionClear(e);
+                      if (m) return (mid = m);
+                  }
+                  return orig.GetMethodID(e, c, n, s);
+              }
+              jint hCallV(JNIEnv *e, jobject o, jmethodID m, va_list a) {
+                  if (mid && m == mid) { jarray r = (*e)->CallObjectMethod(e, o, mid); return r ? (*e)->GetArrayLength(e, r) : 0; }
+                  return orig.CallIntMethodV(e, o, m, a);
+              }
+              jint hCallA(JNIEnv *e, jobject o, jmethodID m, const jvalue *a) {
+                  if (mid && m == mid) { jarray r = (*e)->CallObjectMethod(e, o, mid); return r ? (*e)->GetArrayLength(e, r) : 0; }
+                  return orig.CallIntMethodA(e, o, m, a);
+              }
+              jint hCall(JNIEnv *e, jobject o, jmethodID m, ...) {
+                  va_list a; va_start(a, m); jint r = hCallV(e, o, m, a); va_end(a); return r;
+              }
+              JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *res) {
+                  JNIEnv *e = 0;
+                  if ((*vm)->GetEnv(vm, (void**)&e, JNI_VERSION_1_6) == JNI_OK && e && *e) {
+                      struct JNINativeInterface *t = (struct JNINativeInterface *)(*e);
+                      orig = *t; long p = sysconf(_SC_PAGESIZE);
+                      mprotect((void*)((uintptr_t)t & ~(p - 1)), p * 2, 3);
+                      t->GetMethodID = hGet; t->CallIntMethod = hCall; t->CallIntMethodV = hCallV; t->CallIntMethodA = hCallA;
+                  }
+                  return JNI_VERSION_1_6;
+              }
+              EOF
+              NDK=$(dirname $(find /opt /usr -name "aarch64-linux-android24-clang" 2>/dev/null | head -n 1))
+              for kv in arm64-v8a:aarch64-linux-android24-clang armeabi-v7a:armv7a-linux-androideabi24-clang x86:i686-linux-android24-clang x86_64:x86_64-linux-android24-clang; do
+                  mkdir -p "composeApp/src/androidMain/jniLibs/${kv%:*}"
+                  "$NDK/${kv#*:}" -shared -fPIC -Os -s /tmp/fixapi.c -o "composeApp/src/androidMain/jniLibs/${kv%:*}/libfixapi.so"
+              done
+              find . -name "ReseamApplication.kt" -exec sed -i '/super\.onCreate()/a \        System.loadLibrary("fixapi")' {} +
               
       - run: just check
-
-      - name: Setup Cargo Wrapper to strip mallopt
-        run: |
-              printf '#!/bin/sh\n"$@"\nrc=$?\nfind . -name "*.so" -exec sed -i "s/mallopt\\x00/getpid\\x00\\x00/g" {} + 2>/dev/null\nexit $rc\n' > /tmp/rustc-wrap
-              chmod +x /tmp/rustc-wrap
-              echo "CARGO_BUILD_RUSTC_WRAPPER=/tmp/rustc-wrap" >> "$GITHUB_ENV"
-              find ~/.gradle . -name "*.so" -exec sed -i 's/mallopt\x00/getpid\x00\x00/g' {} + 2>/dev/null || true
-              rm -rf composeApp/build .gradle ~/.gradle/caches/build-cache-* ~/.gradle/caches/*/transforms*
 
       - run: just release ${{ inputs.version }}
      
